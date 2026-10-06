@@ -1,0 +1,104 @@
+---
+title: Terminal API
+description: Interact with OpenCode's embedded terminal panes programmatically via the PTY HTTP and WebSocket API.
+---
+
+OpenCode's embedded terminals (the TUI [terminal workspace](/docs/tui) and the desktop terminal panel) are persistent PTY sessions backed by the `opencode-pty` daemon. Each terminal is addressable over the local server API: you can list them, inspect them, read their rendered screen, and connect a WebSocket to send keystrokes and receive live output.
+
+The API is **experimental**: endpoints may change between versions. Verify against `GET /openapi.json` on your server.
+
+## Server discovery
+
+A background service (`opencode serve --service`) hosts the API. Its URL and Basic-auth password are written at:
+
+```sh
+cat ~/.local/state/opencode/service.json
+# {"url":"http://127.0.0.1:49374", "password":"…", …}
+```
+
+Authenticate with HTTP Basic auth (username `opencode`, password from the file above). Most endpoints also accept an `x-opencode-directory` header (or `directory` query parameter) to scope the request to a project directory.
+
+## List a session's terminals
+
+```sh
+curl -su "opencode:$PW" \
+  "http://127.0.0.1:49374/api/experimental/session/<SESSION_ID>/terminal"
+```
+
+```json
+{
+  "data": [
+    {
+      "id": "pty_persistent_5430736284631273",
+      "title": "btop",
+      "command": "/bin/zsh",
+      "status": "running",
+      "pid": 80549,
+      "size": { "cols": 84, "rows": 61 },
+      "output": { "head": 17784945, "tail": 19882097 }
+    }
+  ]
+}
+```
+
+The non-experimental mirrors live under `/api/pty` (`GET /api/pty`, `POST /api/pty` to create, `GET|PUT|DELETE /api/pty/{ptyID}`).
+
+## Read the rendered screen
+
+Fetch the current screen state of a terminal without attaching to it:
+
+```sh
+curl -su "opencode:$PW" \
+  "http://127.0.0.1:49374/api/experimental/persistent-pty/<PTY_ID>/snapshot"
+```
+
+This works even when the TUI is currently displaying a different tab or session.
+
+## Connect with a WebSocket
+
+Open the WebSocket in two steps:
+
+**1. Mint a short-lived connect ticket.** Requests to the connect-token endpoint require the CSRF/origin gate header `x-opencode-ticket: 1` (the literal string `1`) and an allowed `Origin`:
+
+```sh
+curl -su "opencode:$PW" -X POST \
+  -H "x-opencode-ticket: 1" -H "Origin: http://127.0.0.1:49374" \
+  "http://127.0.0.1:49374/api/experimental/persistent-pty/<PTY_ID>/connect-token"
+# → {"data":{"ticket":"…","expires_in":60}}
+```
+
+Tickets are single-use and expire after 60 seconds.
+
+**2. Open the WebSocket** with the ticket:
+
+```
+GET /api/experimental/persistent-pty/<PTY_ID>/connect?role=controller&takeover=true&ticket=<TICKET>
+```
+
+### Protocol
+
+- **Inbound frames are raw UTF-8 keystrokes.** Each frame is delivered to the running program as if typed. Backspace is `\x7f`, Enter is `\r`. TUI applications may drop bursty input — send one character at a time for interactive programs.
+- **Outbound frames are raw terminal output.** One control frame consists of a `0x00` byte followed by JSON `{"cursor": N}`, carrying the absolute output cursor so clients can resume later with the `cursor` query parameter.
+- Connect with `role=controller&takeover=true` to take the controller seat and send input, or without these parameters to observe only.
+
+### Example (Bun)
+
+```ts
+const svc = JSON.parse(await Bun.file(process.env.HOME + "/.local/state/opencode/service.json").text())
+const auth = "Basic " + btoa("opencode:" + svc.password)
+const BASE = svc.url
+const PID = "<PTY_ID>"
+
+const ticket = (await (
+  await fetch(`${BASE}/api/experimental/persistent-pty/${PID}/connect-token`, {
+    method: "POST",
+    headers: { Authorization: auth, "x-opencode-ticket": "1", Origin: BASE },
+  })
+).json()).data.ticket
+
+const ws = new WebSocket(
+  `${BASE.replace(/^http/, "ws")}/api/experimental/persistent-pty/${PID}/connect?role=controller&takeover=true&ticket=${encodeURIComponent(ticket)}`
+)
+ws.onopen = () => ws.send("echo hi\r")
+ws.onmessage = (e) => process.stdout.write(typeof e.data === "string" ? e.data : "")
+```
